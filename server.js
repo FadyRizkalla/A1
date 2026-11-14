@@ -9,7 +9,12 @@ const fs = require("fs");
 const PORT = process.env.PORT || 3000;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "data", "events.db");
 const IS_PROD = process.env.NODE_ENV === "production";
-// e.g. "live.concordia.ca,concordia.ca" — leave empty to allow any email
+const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const EMAIL_FROM = process.env.EMAIL_FROM || "";
+const VERIFIED_EMAIL_DOMAINS = (process.env.VERIFIED_EMAIL_DOMAINS || "live.concordia.ca,concordia.ca")
+  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+// Optional extra restriction, e.g. "live.concordia.ca"
 const ALLOWED_DOMAINS = (process.env.ALLOWED_EMAIL_DOMAINS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 // Site moderators who can delete anything, e.g. "you@live.concordia.ca"
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -57,7 +62,16 @@ db.exec(`
     email         TEXT NOT NULL UNIQUE COLLATE NOCASE,
     name          TEXT NOT NULL,
     password_hash TEXT NOT NULL,
+    email_verified_at TEXT,
+    program       TEXT NOT NULL DEFAULT '',
+    study_year    TEXT NOT NULL DEFAULT '',
+    courses       TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
@@ -112,6 +126,14 @@ db.exec(`
     PRIMARY KEY (user_id, event_id)
   );
 `);
+
+{
+  const cols = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
+  if (!cols.includes("email_verified_at")) db.exec("ALTER TABLE users ADD COLUMN email_verified_at TEXT");
+  if (!cols.includes("program")) db.exec("ALTER TABLE users ADD COLUMN program TEXT NOT NULL DEFAULT ''");
+  if (!cols.includes("study_year")) db.exec("ALTER TABLE users ADD COLUMN study_year TEXT NOT NULL DEFAULT ''");
+  if (!cols.includes("courses")) db.exec("ALTER TABLE users ADD COLUMN courses TEXT NOT NULL DEFAULT ''");
+}
 
 // Migrate databases created by v1 (anonymous posts with delete tokens)
 {
@@ -172,7 +194,40 @@ function parseCookies(header) {
   });
   return out;
 }
-const publicUser = (u) => (u ? { id: u.id, name: u.name, email: u.email, is_site_admin: ADMIN_EMAILS.includes(u.email.toLowerCase()) } : null);
+const publicUser = (u) => (u ? {
+  id: u.id, name: u.name, email: u.email, email_verified: !!u.email_verified_at,
+  program: u.program || "", study_year: u.study_year || "", courses: u.courses || "",
+  is_site_admin: ADMIN_EMAILS.includes(u.email.toLowerCase()),
+} : null);
+
+async function sendVerificationEmail(email, token) {
+  const verificationUrl = new URL(`/#/verify/${token}`, APP_URL).href;
+  if (!RESEND_API_KEY || !EMAIL_FROM) {
+    if (IS_PROD) throw new Error("RESEND_API_KEY and EMAIL_FROM must be configured to send verification email.");
+    console.log(`Email verification link for ${email}: ${verificationUrl}`);
+    return;
+  }
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: EMAIL_FROM,
+      to: [email],
+      subject: "Verify your Concordia Events email",
+      text: `Confirm that you can access this Concordia email address:\n\n${verificationUrl}\n\nThis link expires in 24 hours. Verifying your email does not confirm current student enrollment.`,
+    }),
+  });
+  if (!response.ok) throw new Error(`Resend returned HTTP ${response.status}.`);
+}
+
+async function issueVerificationEmail(user) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  await sendVerificationEmail(user.email, token);
+  db.prepare(`
+    INSERT INTO email_verification_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET token_hash = excluded.token_hash, expires_at = excluded.expires_at
+  `).run(user.id, sha256(token), new Date(Date.now() + 24 * 3600e3).toISOString());
+}
 
 // ---------- Rate limiter ----------
 const hits = new Map();
@@ -284,15 +339,20 @@ app.use(express.static(path.join(__dirname, "public")));
 app.use("/api", loadUser, csrf);
 
 app.get("/api/meta", (_req, res) =>
-  res.json({ categories: CATEGORIES, buildings: BUILDINGS, club_types: CLUB_TYPES, allowed_domains: ALLOWED_DOMAINS }));
+  res.json({
+    categories: CATEGORIES, buildings: BUILDINGS, club_types: CLUB_TYPES,
+    allowed_domains: ALLOWED_DOMAINS.length ? ALLOWED_DOMAINS : VERIFIED_EMAIL_DOMAINS,
+  }));
 
 // ----- Auth -----
-app.post("/api/auth/signup", rateLimit(10, 3600e3, "signup"), (req, res) => {
+app.post("/api/auth/signup", rateLimit(10, 3600e3, "signup"), async (req, res) => {
   const email = clean(req.body?.email, 120)?.toLowerCase();
   const name = clean(req.body?.name, 60);
   const password = String(req.body?.password || "");
   const errors = [];
   if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) errors.push("Enter a valid email.");
+  else if (!VERIFIED_EMAIL_DOMAINS.includes(email.split("@")[1]))
+    errors.push(`Use a Concordia email (${VERIFIED_EMAIL_DOMAINS.map((d) => "@" + d).join(" or ")}).`);
   else if (ALLOWED_DOMAINS.length && !ALLOWED_DOMAINS.includes(email.split("@")[1]))
     errors.push(`Use your ${ALLOWED_DOMAINS.map((d) => "@" + d).join(" or ")} email.`);
   if (!name || name.length < 2) errors.push("Enter your name.");
@@ -302,8 +362,15 @@ app.post("/api/auth/signup", rateLimit(10, 3600e3, "signup"), (req, res) => {
     return res.status(409).json({ error: "An account with that email already exists. Log in instead." });
   const info = db.prepare("INSERT INTO users (email, name, password_hash, created_at) VALUES (?,?,?,?)")
     .run(email, name, hashPassword(password), nowIso());
-  createSession(res, info.lastInsertRowid);
-  res.status(201).json({ user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid)) });
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
+  try {
+    await issueVerificationEmail(user);
+  } catch (err) {
+    console.error("Failed to send signup verification email:", err.message);
+    return res.status(503).json({ error: "Your account was created, but the verification email could not be sent. Log in and try sending it again." });
+  }
+  createSession(res, user.id);
+  res.status(201).json({ user: publicUser(user) });
 });
 
 app.post("/api/auth/login", rateLimit(20, 15 * 60e3, "login"), (req, res) => {
@@ -313,6 +380,36 @@ app.post("/api/auth/login", rateLimit(20, 15 * 60e3, "login"), (req, res) => {
     return res.status(401).json({ error: "Wrong email or password." });
   createSession(res, user.id);
   res.json({ user: publicUser(user) });
+});
+
+app.post("/api/auth/verify", (req, res) => {
+  const token = clean(req.body?.token, 100);
+  if (!token) return res.status(400).json({ error: "Verification link is invalid or has expired." });
+  const record = db.prepare(`
+    SELECT user_id FROM email_verification_tokens WHERE token_hash = ? AND expires_at > ?
+  `).get(sha256(token), nowIso());
+  if (!record) return res.status(400).json({ error: "Verification link is invalid or has expired. Request a new one from your profile." });
+  db.transaction(() => {
+    db.prepare("UPDATE users SET email_verified_at = ? WHERE id = ?").run(nowIso(), record.user_id);
+    db.prepare("DELETE FROM email_verification_tokens WHERE user_id = ?").run(record.user_id);
+  })();
+  res.json({ ok: true });
+});
+
+app.post("/api/auth/resend-verification", rateLimit(3, 3600e3, "resend-verification"), async (req, res) => {
+  const email = clean(req.body?.email, 120)?.toLowerCase();
+  const generic = { message: "If an unverified account exists for that Concordia email, a new verification link has been sent or generated." };
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || !VERIFIED_EMAIL_DOMAINS.includes(email.split("@")[1]))
+    return res.json(generic);
+  const user = db.prepare("SELECT * FROM users WHERE email = ? AND email_verified_at IS NULL").get(email);
+  if (!user) return res.json(generic);
+  try {
+    await issueVerificationEmail(user);
+    res.json(generic);
+  } catch (err) {
+    console.error("Failed to resend verification email:", err.message);
+    res.status(503).json({ error: "The verification email could not be sent. Please try again later." });
+  }
 });
 
 app.post("/api/auth/logout", (req, res) => {
@@ -334,6 +431,25 @@ app.get("/api/me", (req, res) => {
       SELECT c.id, c.slug, c.name, c.type FROM follows f JOIN clubs c ON c.id = f.club_id
       WHERE f.user_id = ? ORDER BY c.name`).all(uid),
   });
+});
+
+app.patch("/api/me/profile", requireUser, (req, res) => {
+  const program = clean(req.body?.program, 120) || "";
+  const studyYear = clean(req.body?.study_year, 40) || "";
+  const courses = cleanText(req.body?.courses, 500) || "";
+  db.prepare("UPDATE users SET program = ?, study_year = ?, courses = ? WHERE id = ?")
+    .run(program, studyYear, courses, req.user.id);
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
+  res.json({ user: publicUser(user) });
+});
+
+app.get("/api/users/:id", requireUser, (req, res) => {
+  const user = db.prepare(`
+    SELECT id, name, program, study_year, courses, email_verified_at
+    FROM users WHERE id = ?
+  `).get(Number(req.params.id));
+  if (!user) return res.status(404).json({ error: "Student profile not found." });
+  res.json({ ...user, email_verified: !!user.email_verified_at, email_verified_at: undefined });
 });
 
 // ----- Clubs -----
@@ -542,10 +658,11 @@ app.get("/api/events/:id/ics", (req, res) => {
   res.send(ics);
 });
 
-// Housekeeping: prune old events and expired sessions hourly
+// Housekeeping: prune old events, sessions, and verification tokens hourly
 setInterval(() => {
   db.prepare("DELETE FROM events WHERE ends_at < ?").run(new Date(Date.now() - 30 * 86400e3).toISOString());
   db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(nowIso());
+  db.prepare("DELETE FROM email_verification_tokens WHERE expires_at < ?").run(nowIso());
 }, 3600e3).unref();
 
 if (require.main === module) {

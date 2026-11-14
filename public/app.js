@@ -100,7 +100,7 @@ $("#authForm").addEventListener("submit", async (e) => {
     await api(`/api/auth/${authMode}`, { method: "POST", body });
     $("#authDialog").close();
     await refreshMe();
-    toast(authMode === "signup" ? `Welcome, ${state.me.user.name}!` : "Logged in");
+    toast(authMode === "signup" ? `Welcome, ${state.me.user.name}! You can use the app now; verify your email from your profile.` : "Logged in");
     const fn = afterAuth; afterAuth = null;
     if (fn) fn(); else route();
   } catch (err) { showError($("#authError"), err.message); }
@@ -183,7 +183,9 @@ function eventCard(e, { highlight = false } = {}) {
   const full = e.capacity && e.going >= e.capacity;
   const by = e.club
     ? `<a href="#/c/${esc(e.club.slug)}" class="club-link">${esc(e.club.name)}</a>`
-    : esc(e.organizer);
+    : loggedIn() && e.user_id
+      ? `<a href="#/u/${e.user_id}" class="club-link">${esc(e.organizer)}</a>`
+      : esc(e.organizer);
   return `
     <article class="card ${highlight ? "highlight" : ""}" id="ev-${e.id}">
       <div class="time">
@@ -436,8 +438,30 @@ async function viewMe() {
   view.innerHTML = `
     <section class="club-hero">
       <div class="club-avatar big">${esc(initials(user.name))}</div>
-      <div class="club-body"><h1>${esc(user.name)}</h1><div class="muted">${esc(user.email)}</div></div>
+      <div class="club-body"><h1>${esc(user.name)}</h1><div class="muted">${esc(user.email)}</div>
+        <div class="profile-badges">${user.email_verified ? `<span class="pill">Concordia email verified</span>` : `<span class="pill">Email not verified</span>`}</div>
+      </div>
       <div class="hero-actions"><button class="btn" data-action="logout">Log out</button></div>
+    </section>
+    ${!user.email_verified ? `<section class="profile-note">
+      <p>Verify that you can access your Concordia email to earn the email-verified badge. This confirms email access, not current student enrollment.</p>
+      <button class="btn small" data-action="resend-verification">Send verification link again</button>
+    </section>` : ""}
+    <section class="profile-editor">
+      <h2 class="section-title">Your student profile</h2>
+      <p class="muted small">These details are visible to signed-in users. Your email stays private.</p>
+      <form id="profileForm" class="profile-form">
+        <label><span>Program / major</span>
+          <input name="program" maxlength="120" value="${esc(user.program)}" placeholder="Computer Science" />
+        </label>
+        <label><span>Year of study</span>
+          <input name="study_year" maxlength="40" value="${esc(user.study_year)}" placeholder="2nd year" />
+        </label>
+        <label><span>Courses this semester <span class="muted">(one per line)</span></span>
+          <textarea name="courses" rows="4" maxlength="500" placeholder="COMP 348&#10;MATH 204">${esc(user.courses)}</textarea>
+        </label>
+        <button class="btn primary" type="submit">Save profile</button>
+      </form>
     </section>
     <div class="cols">
       <section>
@@ -455,7 +479,58 @@ async function viewMe() {
     </div>
     <h2 class="section-title">Your upcoming posts</h2>
     ${eventList(mine, "You haven't posted any upcoming events.")}`;
+  $("#profileForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = Object.fromEntries(new FormData(e.target).entries());
+    try {
+      await api("/api/me/profile", { method: "PATCH", body });
+      await refreshMe();
+      toast("Profile saved");
+      viewMe();
+    } catch (err) { toast(err.message); }
+  });
   view._reload = viewMe;
+}
+
+async function viewUserProfile(id) {
+  setActiveNav("");
+  if (!loggedIn()) {
+    view.innerHTML = `<div class="empty"><strong>Log in to view student profiles.</strong><br/><button class="btn primary" data-action="login" style="margin-top:12px">Log in</button></div>`;
+    return;
+  }
+  try {
+    const user = await api(`/api/users/${encodeURIComponent(id)}`);
+    const courses = user.courses.split(/\r?\n/).map((course) => course.trim()).filter(Boolean);
+    view.innerHTML = `
+      <p class="crumbs"><a href="#/">← All events</a></p>
+      <section class="club-hero">
+        <div class="club-avatar big">${esc(initials(user.name))}</div>
+        <div class="club-body"><h1>${esc(user.name)}</h1>
+          ${user.email_verified ? `<span class="pill">Concordia email verified</span>` : ""}
+        </div>
+      </section>
+      <section class="profile-details">
+        ${user.program ? `<div><strong>Program / major</strong><p>${esc(user.program)}</p></div>` : ""}
+        ${user.study_year ? `<div><strong>Year of study</strong><p>${esc(user.study_year)}</p></div>` : ""}
+        ${courses.length ? `<div><strong>Courses this semester</strong><ul>${courses.map((course) => `<li>${esc(course)}</li>`).join("")}</ul></div>` : ""}
+        ${!user.program && !user.study_year && !courses.length ? `<p class="muted">This student hasn’t added profile details yet.</p>` : ""}
+      </section>
+      <p class="muted small">Email verification confirms access to a Concordia email address; it does not confirm current enrollment.</p>`;
+  } catch (err) {
+    view.innerHTML = `<div class="empty"><strong>${esc(err.message)}</strong><br/><a href="#/">Back to events</a></div>`;
+  }
+}
+
+async function viewVerify(token) {
+  setActiveNav("");
+  view.innerHTML = `<div class="empty">Verifying your Concordia email…</div>`;
+  try {
+    await api("/api/auth/verify", { method: "POST", body: { token } });
+    if (loggedIn()) await refreshMe();
+    view.innerHTML = `<div class="empty"><strong>Your Concordia email is verified.</strong><br/><p>Email verification confirms access to the address, not current student enrollment.</p><a href="#/me">View your profile</a></div>`;
+  } catch (err) {
+    view.innerHTML = `<div class="empty"><strong>${esc(err.message)}</strong><br/><a href="#/me">Go to your profile to request a new link</a></div>`;
+  }
 }
 
 // ---------- global click actions ----------
@@ -468,6 +543,15 @@ document.addEventListener("click", async (ev) => {
   const action = t.dataset.action;
   if (action === "login") return openAuth("login");
   if (action === "signup") return openAuth("signup");
+  if (action === "resend-verification") {
+    t.disabled = true;
+    try {
+      const result = await api("/api/auth/resend-verification", { method: "POST", body: { email: state.me.user.email } });
+      toast(result.message);
+    } catch (err) { toast(err.message); }
+    finally { t.disabled = false; }
+    return;
+  }
   if (action === "create-club") return openCreateClub();
   if (action === "post-club") return openPost(t.dataset.clubId);
   if (action === "logout") {
@@ -535,6 +619,8 @@ async function route() {
   if (a === "c" && b) return viewClub(decodeURIComponent(b));
   if (a === "e" && b) return viewEvent(decodeURIComponent(b));
   if (a === "me") return viewMe();
+  if (a === "u" && b) return viewUserProfile(decodeURIComponent(b));
+  if (a === "verify" && b) return viewVerify(decodeURIComponent(b));
   if (h.startsWith("e=")) { location.hash = `#/e/${h.slice(2)}`; return; } // links from v1
   return viewEvents("");
 }
